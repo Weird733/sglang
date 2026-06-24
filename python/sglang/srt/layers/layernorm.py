@@ -779,6 +779,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         ctx = get_forward_context()
+        print(f"----------------forward_npu-----------------")
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
@@ -787,15 +788,15 @@ class GemmaRMSNorm(MultiPlatformOp):
             norm_out, residual = add_gemma_rms_norm(
                 x, self.weight, residual, self.variance_epsilon
             )
-            if ctx is not None and ctx.forward_batch.forward_mode.is_decode():
-                #我要将这块内容的的norm_out和residual改成add_gemma_rms_norm输出相同shape和类型，但是将值全换成1.
-                norm_out = torch.ones_like(x)
-                residual = torch.ones_like(residual)
+            # if ctx is not None and ctx.forward_batch.forward_mode.is_decode():
+            #     #我要将这块内容的的norm_out和residual改成add_gemma_rms_norm输出相同shape和类型，但是将值全换成1.
+            norm_out = torch.ones_like(x)
+            residual = torch.ones_like(residual)
             return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        if ctx is not None and ctx.forward_batch.forward_mode.is_decode():
-            x = torch.ones_like(x)
+        # if ctx is not None and ctx.forward_batch.forward_mode.is_decode():
+        x = torch.ones_like(x)
         return x
 
     def forward_xpu(
