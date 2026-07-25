@@ -99,15 +99,27 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             skip_guard_context = empty_context()
 
-        graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
             and self._memory_saver_adapter.enabled
         ):
-            graph_ctx = partial(
+            # torch.npu.graph accepts the graph as positional (npu_graph),
+            # but torch_memory_saver.cuda_graph() only accepts **kwargs and
+            # expects cuda_graph=graph (same convention as the CUDA backend).
+            # Wrap so the call site below works for both paths.
+            _ms_cuda_graph = partial(
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
             )
+
+            @contextmanager
+            def graph_ctx(graph, **kwargs):
+                # auto_dispatch_capture is NPU-specific; torch_memory_saver
+                # (CUDA-oriented) doesn't accept it.
+                kwargs.pop("auto_dispatch_capture", None)
+                with _ms_cuda_graph(cuda_graph=graph, **kwargs):
+                    yield
+
         else:
             graph_ctx = torch.npu.graph
 
