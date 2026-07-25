@@ -1759,7 +1759,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if all_weights:
             mtp_weights = [(n, w) for n, w in all_weights if "mtp" in n]
             if mtp_weights:
+                logger.info(
+                    "[MTP weights] EAGLEWorkerV2 forwarding %d MTP params to draft model",
+                    len(mtp_weights),
+                )
                 self.draft_worker.draft_runner.model.load_weights(mtp_weights)
+                logger.info("[MTP weights] EAGLEWorkerV2 draft model load_weights done")
+            else:
+                logger.warning("[MTP weights] EAGLEWorkerV2: no MTP params found in %d received weights", len(all_weights))
+        else:
+            logger.warning("[MTP weights] EAGLEWorkerV2: _latest_weight_update is None, nothing to forward")
         return True, "Succeeded to update model weights."
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

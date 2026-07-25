@@ -2114,14 +2114,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 handle.wait()
 
             # Log MTP weight statistics for monitoring
-            logger.info("----_update_weights_from_distributed----")
             mtp_weights = [(n, w) for n, w in weights if "mtp" in n.lower()]
             if mtp_weights:
                 mtp_log_parts = []
                 for name, w in mtp_weights:
                     w_float = w.data.float()
+                    chk = w_float.mean().item()
                     mtp_log_parts.append(
-                        f"  {name}: mean={w_float.mean().item():.8f}, "
+                        f"  {name}: mean={chk:.12f}, "
                         f"max={w_float.max().item():.8f}, min={w_float.min().item():.8f}"
                     )
                 logger.info(
