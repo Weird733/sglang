@@ -1744,6 +1744,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
         out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
         return out
 
+    def update_weights_from_distributed(self, recv_req):
+        """Forward MTP/draft weights to the draft runner after the tp_worker has
+        already received them via NCCL broadcast.
+
+        The tp_worker owns the NCCL collective — this method only needs to
+        retrieve the MTP subset from the target runner's receive cache and apply
+        it to the draft model.  The cache is cleared immediately to release the
+        temporary GPU tensor references.
+        """
+        target_runner = self.target_worker.model_runner
+        all_weights = getattr(target_runner, "_latest_weight_update", None)
+        target_runner._latest_weight_update = None
+        if all_weights:
+            mtp_weights = [(n, w) for n, w in all_weights if "mtp" in n]
+            if mtp_weights:
+                self.draft_worker.draft_runner.model.load_weights(mtp_weights)
+        return True, "Succeeded to update model weights."
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self._draft_worker.draft_runner.update_weights_from_disk(
             recv_req.model_path,

@@ -140,10 +140,14 @@ class SchedulerWeightUpdaterManager:
         """Update the online model parameter."""
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
-            if success:
+            tp_success = success
+            if success and self.draft_worker is not None:
+                success, message = self.draft_worker.update_weights_from_distributed(recv_req)
+            if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
-            else:
+            if not success:
                 logger.error(message)
+            torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )

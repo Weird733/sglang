@@ -1499,6 +1499,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+        logger.info(f"---self.server_args.enable_weights_cpu_backup:{self.server_args.enable_weights_cpu_backup}---self.is_draft_worker:{self.is_draft_worker}----")
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
@@ -2112,7 +2113,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for handle in handles:
                 handle.wait()
 
+            # Log MTP weight statistics for monitoring
+            logger.info("----_update_weights_from_distributed----")
+            mtp_weights = [(n, w) for n, w in weights if "mtp" in n.lower()]
+            if mtp_weights:
+                mtp_log_parts = []
+                for name, w in mtp_weights:
+                    w_float = w.data.float()
+                    mtp_log_parts.append(
+                        f"  {name}: mean={w_float.mean().item():.8f}, "
+                        f"max={w_float.max().item():.8f}, min={w_float.min().item():.8f}"
+                    )
+                logger.info(
+                    f"[MTP weights] update_weights_from_distributed ({len(mtp_weights)} params):\n"
+                    + "\n".join(mtp_log_parts)
+                )
+
             self.model.load_weights(weights)
+            self._latest_weight_update = weights
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -2144,6 +2162,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
+            logger.info("----_update_bucketed_weights_from_distributed----")
+            # Log MTP weight statistics for monitoring
+            mtp_weights = [(n, w) for n, w in reconstructed_tensors if "mtp" in n.lower()]
+            if mtp_weights:
+                mtp_log_parts = []
+                for name, w in mtp_weights:
+                    w_float = w.data.float()
+                    mtp_log_parts.append(
+                        f"  {name}: mean={w_float.mean().item():.8f}, "
+                        f"max={w_float.max().item():.8f}, min={w_float.min().item():.8f}"
+                    )
+                logger.info(
+                    f"[MTP weights] update_bucketed_weights_from_distributed ({len(mtp_weights)} params):\n"
+                    + "\n".join(mtp_log_parts)
+                )
+
             self.model.load_weights(reconstructed_tensors)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
