@@ -81,6 +81,170 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_flags().sampling_backend == "ascend"
+        # Generate uniform noise on a side stream while the model is running, and
+        # apply the exponential-race transform at consumption time on the main
+        # stream, exactly matching stock aten::exponential_ semantics (NPU
+        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
+        # uniform_() decomposes to DSARandomUniform plus an async
+        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
+        # the side stream cannot contend with the model's vector-core kernels
+        # even when it overlaps the next forward (v1 ran the full exponential_()
+        # chain here and its AIV tail contended with forward).
+        # This is opt-in because it changes the random-number sequence, although it
+        # preserves the categorical sampling distribution.
+        self.enable_async_exponential = is_npu() and get_bool_env_var(
+            "SGLANG_NPU_ASYNC_EXPONENTIAL"
+        )
+        self._async_exponential_stream = None
+        self._async_exponential_event = None
+        self._async_exponential_u = None
+        self._async_exponential_pending = False
+        self._async_exp_min_bound = None
+
+    def can_prepare_async_exponential(
+        self, sampling_info: SamplingBatchInfo
+    ) -> bool:
+        """Return whether this batch can use precomputed uniform noise."""
+        return (
+            self.enable_async_exponential
+            and not sampling_info.is_all_greedy
+            and sampling_info.sampling_seed is None
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        )
+
+    @torch.no_grad()
+    def prepare_async_exponential(
+        self,
+        batch_size: int,
+        vocab_size: int,
+        sampling_info: SamplingBatchInfo,
+        device: torch.device,
+    ) -> bool:
+        """Enqueue U(0,1) noise before model forward on a dedicated NPU stream.
+
+        Reusing the buffer is safe because the side stream first waits for all
+        previously enqueued work on the current stream. The sampling path later
+        inserts a device-side event wait; it never synchronizes the CPU.
+        """
+        if not self.can_prepare_async_exponential(sampling_info):
+            return False
+
+        # A delayed sampler may still own the previous buffer. Do not overwrite it.
+        if self._async_exponential_pending:
+            logger.warning(
+                "Skip async exponential preparation because the previous batch "
+                "has not consumed its random buffer"
+            )
+            return False
+
+        if self._async_exponential_stream is None:
+            self._async_exponential_stream = torch.npu.Stream()
+            self._async_exponential_event = torch.npu.Event()
+            logger.info(
+                "Enabled asynchronous NPU exponential-race sampling "
+                "(uniform noise on side stream, stock-exponential argmax consumption)"
+            )
+
+        current_stream = torch.npu.current_stream()
+        self._async_exponential_stream.wait_stream(current_stream)
+
+        expected_shape = (batch_size, vocab_size)
+        with torch.npu.stream(self._async_exponential_stream):
+            u = self._async_exponential_u
+            if (
+                u is None
+                or tuple(u.shape) != expected_shape
+                or u.dtype != torch.float32
+                or u.device.type != torch.device(device).type
+            ):
+                # SGLang converts next-token logits to FP32 before sampling; the
+                # noise grid must match CANN's fp32 uniform to preserve the
+                # incumbent sampling distribution.
+                u = torch.empty(
+                    expected_shape,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                self._async_exponential_u = u
+            u.uniform_()
+            self._async_exponential_event.record()
+
+        self._async_exponential_pending = True
+        return True
+
+    def _sample_with_async_exponential(
+        self, probs: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Consume precomputed U(0,1) noise using the exponential-race identity.
+
+        The full stock exponential_ transform (complement + clamp + -log) runs
+        here on the main stream (serial work that the sampling path owns
+        anyway), keeping the side stream free of AIV kernels so it cannot
+        slow down the model forward.
+        """
+        if not self._async_exponential_pending:
+            return None
+
+        u = self._async_exponential_u
+        self._async_exponential_pending = False
+        if (
+            u is None
+            or u.shape != probs.shape
+            or u.dtype != probs.dtype
+            or u.device != probs.device
+        ):
+            logger.warning(
+                "Async uniform buffer does not match probs; falling back to "
+                "torch.multinomial (u=%s/%s/%s, probs=%s/%s/%s)",
+                None if u is None else tuple(u.shape),
+                None if u is None else u.dtype,
+                None if u is None else u.device,
+                tuple(probs.shape),
+                probs.dtype,
+                probs.device,
+            )
+            return None
+
+        current_stream = torch.npu.current_stream()
+        current_stream.wait_event(self._async_exponential_event)
+        u.record_stream(current_stream)
+
+        # Do not modify probs in place: the standard backend reuses it for logprobs.
+        # argmax over probs / q with q ~ Exp(1): v1's production consumption
+        # form, kept because the stock argmax kernel is healthy while argmin at
+        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
+        # q is produced by transforming u in place with the exact stock
+        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
+        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
+        # The guard is a single torch.minimum against a cached 0-dim bound
+        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
+        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
+        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
+        # the legacy-family ClipByValueV2 op with two scalar->device uploads
+        # per call, which costs more than the unary-template kernels used by
+        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
+        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
+        # mapped it to +inf/+0.0 instead). For fp32 q stays within
+        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
+        # inf/NaN edge.
+        # All transform ops run here on the main stream; the side stream stays
+        # pure DSA uniform with zero AIV kernels.
+        bound = self._async_exp_min_bound
+        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
+            bound = torch.full(
+                (),
+                1.0 - torch.finfo(u.dtype).eps / 2.0,
+                dtype=u.dtype,
+                device=u.device,
+            )
+            self._async_exp_min_bound = bound
+        u.neg_().add_(1.0)
+        torch.minimum(u, bound, out=u)
+        u.log_().neg_()
+        sampled_index = torch.div(probs, u).argmax(dim=-1)
+        return sampled_index.view(-1).to(torch.int32)
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -115,6 +279,9 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        # In the plain probability path, keep the softmax output and apply log
+        # only to the values requested by the caller.
+        logprobs_are_probs = False
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
@@ -180,9 +347,13 @@ class Sampler(nn.Module):
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
 
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                # Do not write the softmax output back into logits: the
+                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
+                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
+                # read again on this path and is overwritten by the next
+                # forward anyway. Trade-off: one extra live [batch, vocab]
+                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
+                probs = torch.softmax(logits, dim=-1)
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
@@ -191,8 +362,9 @@ class Sampler(nn.Module):
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
+                        else probs
                     )
+                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
                 del probs
 
         # Attach logprobs to logits_output (in-place modification)
@@ -206,6 +378,7 @@ class Sampler(nn.Module):
                 token_ids_logprobs,
                 sampling_info,
                 batch_next_token_ids,
+                logprobs_are_probs,
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -225,11 +398,13 @@ class Sampler(nn.Module):
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
         if simple_sampling_case:
-            batch_next_token_ids = sampling_from_probs_torch(
-                probs,
-                sampling_seed=sampling_info.sampling_seed,
-                positions=positions,
-            )
+            batch_next_token_ids = self._sample_with_async_exponential(probs)
+            if batch_next_token_ids is None:
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
         else:
             backend = get_flags().sampling_backend
             if backend == "flashinfer":
@@ -302,7 +477,11 @@ class Sampler(nn.Module):
                     probabilities, sampling_info.sampling_seed, positions
                 ).view(-1)
             else:
-                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
+                batch_next_token_ids = self._sample_with_async_exponential(probs)
+                if batch_next_token_ids is None:
+                    batch_next_token_ids = torch.multinomial(
+                        probs, num_samples=1
+                    ).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
             assert (
@@ -353,9 +532,14 @@ class Sampler(nn.Module):
         token_ids_logprobs: List[List[int]],
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
+        logprobs_are_probs: bool,
     ):
-        # clamp to avoid -inf values
-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
+        # Clamp the extracted values instead of the full [batch, vocab]
+        # matrix. clamp(min=const) is elementwise and monotone
+        # non-decreasing, so it commutes with topk/gather: clamping the
+        # small outputs gives identical results (-inf -> finfo.min) while
+        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
+        clamp_min = torch.finfo(logprobs.dtype).min
 
         # Attach logprobs to logits_output (in-place modification)
         if any(x > 0 for x in top_logprobs_nums):
@@ -363,6 +547,20 @@ class Sampler(nn.Module):
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            # Same extraction as get_top_logprobs, but clamp the
+            # [batch, max_k] topk result in a single kernel before
+            # slicing per request.
+            max_k = max(top_logprobs_nums)
+            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
+            if logprobs_are_probs:
+                top_vals.log_()
+            top_vals.clamp_(min=clamp_min)
+            logits_output.next_token_top_logprobs_val = [
+                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
+            logits_output.next_token_top_logprobs_idx = [
+                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
 
         if any(x is not None for x in token_ids_logprobs):
             (
@@ -372,10 +570,19 @@ class Sampler(nn.Module):
                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
             )
 
-        logits_output.next_token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
-            batch_next_token_ids,
-        ]
+            for row in logits_output.token_ids_logprobs_val:
+                if torch.is_tensor(row):
+                    if logprobs_are_probs:
+                        row.log_()
+                    row.clamp_(min=clamp_min)
+
+        # Gather one value per row directly; this removes the temporary arange
+        # and the 2-D advanced-index operation from the hot path.
+        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
+        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
+        if logprobs_are_probs:
+            next_token_logprobs.log_()
+        logits_output.next_token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo

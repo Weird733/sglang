@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -1053,11 +1053,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+        mm_inputs = batch.multimodal_inputs
+        rl_on_policy_target = get_server_args().rl_on_policy_target
+
+        if (
+            self.spec_info is None
+            and batch.dllm_config is None
+            and (
+                rl_on_policy_target is not None
+                or all(mm_input is None for mm_input in mm_inputs)
+            )
+        ):
+            # Regular text generation does not need to rebuild mRoPE on the
+            # host. init_new has already produced the same flattened token
+            # positions on model_runner.device: clamp_position() for decode,
+            # or compute_position() for extend/mixed. Text mRoPE has identical
+            # temporal/height/width coordinates, so materialize the three rows
+            # directly and avoid the per-request host factories, cat, and H2D.
+            self.mrope_positions = (
+                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+            )
+            return
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
+            mm_input = mm_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
                 if (
