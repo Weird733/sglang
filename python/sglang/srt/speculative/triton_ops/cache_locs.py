@@ -363,6 +363,14 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
+        '''
+        sgl-kernel-npu's cache_loc_assign / cache_loc_update operate under an explicit contract:
+        each row processes max_step tokens, and the tiling dimension of out_cache_loc is
+        cacheLocSize = batchSize * max_step, which is validated on the host side.
+        The host enforces 1 <= max_step <= MAX_STEP (16) and checks the size of out_cache_loc.
+        Therefore, here we allocate exactly batch_size * draft_token_num and pass draft_token_num
+        as max_step; no padding to 16 is needed.
+        '''
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
@@ -374,6 +382,7 @@ def assign_extend_cache_locs_func(
             start_offset,
             end_offset,
             out_cache_loc,
+            draft_token_num,
         )
 
         return out_cache_loc

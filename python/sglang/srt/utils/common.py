@@ -73,6 +73,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from relax.utils.device import is_npu_available
 from unittest import SkipTest
 from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
@@ -176,7 +177,8 @@ def is_npu() -> bool:
     if not hasattr(torch, "npu"):
         return False
 
-    if not torch.npu.is_available():
+    # if not torch.npu.is_available():
+    if not is_npu_available:
         raise RuntimeError(
             "torch_npu detected, but NPU device is not available or visible."
         )
