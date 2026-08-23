@@ -17,8 +17,15 @@ from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
     HiddenStatesDynamicQuant,
 )
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+# GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton persistent
+# kernel（默认 stock，开启：SGLANG_GMM2_TRITON=1）。仅作用于下方
+# NPUUnquantMoEMethod（BF16 无量化路径）。迁移自 old_env/grouped_matmul v1.2.1，
+# 基线 sglang main@bd3f6a793；kernel 内推导 offsets，无 torch.cumsum 链。
+_gmm2_triton = get_bool_env_var("SGLANG_GMM2_TRITON")
 
 
 # DEPRECATED METHOD
@@ -246,6 +253,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
+        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -347,6 +355,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
+        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -503,6 +512,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
+        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
@@ -653,6 +663,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
+        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         offset = getattr(quant_info, f"{weight_prefix}_weight_offset", None)
@@ -689,7 +700,15 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
+        if weight_prefix == "w2" and _gmm2_triton:
+            # Triton GMM2 kernel 以裸指针按 [E, N, K] ND 连续存储读取 w2，
+            # 必须跳过 FRACTAL_NZ cast：NZ 分形重排会让裸指针读取出错。
+            # （与 old_env v1.2 集成一致——当时 unquant.py 的 transpose+cast
+            # 整段被注释。stock npu_grouped_matmul 同样接受 ND/NCL 权重，
+            # 当前 TP4 profile 中 GMM 权重输入格式即为 NCL。）
+            weight.data = weight.data.contiguous()
+        else:
+            weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
@@ -703,7 +722,54 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
+        expert_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        bias_args = self._get_bias_args(quant_info, weight_prefix)
+        if (
+            _gmm2_triton
+            and weight_prefix == "w2"
+            and group_list_type == 1  # per-expert counts（cumulative 不适用）
+            and not bias_args
+        ):
+            # Triton persistent GMM2（gmm/v1，迁移自 old_env grouped_matmul
+            # v1.2.1）：offsets 在 kernel 内由 counts 掩码求和推导，wrapper 不
+            # 含任何 torch 计算（torch.cumsum 链曾实测 ~58us/层并叠加
+            # argsort+scatter 问题致 decode 吞吐 4000→2800，见 bug-fix:
+            # npu-v12-triton-gmm2-rollout-throughput-regression）。
+            # w2 保持 [E, N, K] ND（无需 transpose），expert_tokens 为
+            # per-expert counts（group_list_type=1，int64）。
+            from sgl_kernel_npu.moe.persistent_gmm import (
+                persistent_grouped_matmul,
+            )
+
+            # 一次性取证打印（host 侧元数据，无 device sync，graph capture 安全）：
+            # kernel 的设计契约是 w2 为 [E, N, K]、ND 连续存储（fmt=0）；
+            # fmt=29(FRACTAL_NZ) 或 shape 为 [E, K, N] 都意味着布局被破坏、
+            # 输出必然乱码——排查时先看这行日志。
+            _w2 = getattr(quant_info, "w2_weight")
+            try:
+                import torch_npu as _torch_npu
+
+                _w2_fmt = _torch_npu.get_npu_format(_w2)
+            except Exception:
+                _w2_fmt = "unknown"
+            logger.warning_once(
+                f"[GMM2_TRITON] w2 fmt={_w2_fmt}(0=ND,29=NZ) "
+                f"shape={tuple(_w2.shape)} contig={_w2.is_contiguous()} "
+                f"dtype={_w2.dtype} | x shape={tuple(hidden_states.shape)} "
+                f"dtype={hidden_states.dtype} contig={hidden_states.is_contiguous()} "
+                f"| counts shape={tuple(expert_tokens.shape)} "
+                f"dtype={expert_tokens.dtype}"
+            )
+            return persistent_grouped_matmul(
+                hidden_states,
+                _w2,
+                expert_tokens,
+                # v2.2 自写 init（SGLANG_MOE_FRONT_FUSION=1）原生 excl 直喂，
+                # 省内置 _gmm2_offsets_kernel ~4.4µs/层；None 时走内置前置
+                # kernel（行为与之前完全一致）。
+                offsets=expert_offsets,
+            )
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -712,5 +778,5 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             output_dtype,
             group_list_type=group_list_type,
             transposed=False,
-            **self._get_bias_args(quant_info, weight_prefix),
+            **bias_args,
         )

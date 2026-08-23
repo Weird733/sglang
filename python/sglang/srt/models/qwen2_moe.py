@@ -36,6 +36,7 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -91,7 +92,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -103,15 +109,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.cmo import (
-        shared_expert_on_independent_stream,
-        wait_share_stream,
-    )
-
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -454,9 +451,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
-                shared_output = shared_expert_on_independent_stream(
-                    hidden_states.clone(), self._forward_shared_experts
-                )
+                current_stream = torch.npu.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.npu.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output.record_stream(self.alt_stream)
+                    shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -477,8 +477,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        if enable_dual_stream:
-            wait_share_stream()
+        if hidden_states.shape[0] > 0 and enable_dual_stream:
+            torch.npu.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
@@ -502,6 +502,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        # [moe_whole_process/v1] enqueue 换序：先 alt 流长链（router+routed
+        # experts），再主流 shared expert。L0 profiling 证实原顺序下 shared 段
+        # （区域靠前部分）在 replay 时独占设备先跑、未被 routed 链掩盖；换序后
+        # 长链先起步，shared 的小 GEMM 可填 routed 前段小 kernel 的空窗。
+        # 依赖边不变（alt 仍只等 pre-MoE 主流点，汇合仍 main 等 alt），
+        # 两支对 hidden_states 均只读、clone 仍在主流——数值逐位等价。
+        with torch.cuda.stream(self.alt_stream):
+            router_output = self._forward_router_experts(hidden_states)
+
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate
@@ -525,9 +534,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 stage_shared_expert_add(shared_output, current_stream)
                 staged = True
         # ===== END TO BE REFACTORED ====
-
-        with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
 

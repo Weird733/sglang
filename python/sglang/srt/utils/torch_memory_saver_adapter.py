@@ -41,7 +41,7 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, cuda_graph=None, **kwargs):
         raise NotImplementedError
 
     def disable(self):
@@ -67,7 +67,9 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def region(self, tag: str, enable_cpu_backup: bool = False):
         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
 
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, cuda_graph=None, **kwargs):
+        if cuda_graph is not None:
+            kwargs["cuda_graph"] = cuda_graph
         return _memory_saver.cuda_graph(**kwargs)
 
     def disable(self):
@@ -94,7 +96,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def cuda_graph(self, **kwargs):
+    def cuda_graph(self, cuda_graph=None, **kwargs):
         yield
 
     @contextmanager

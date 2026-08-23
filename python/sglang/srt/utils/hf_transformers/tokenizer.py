@@ -473,6 +473,10 @@ def get_tokenizer(
 
         return TiktokenTokenizer(tokenizer_name)
 
+    # print(f"[tmp log] get_tokenizer {tokenizer_backend=}")
+    # import traceback
+    # traceback.print_stack()
+
     if tokenizer_backend == "fastokens":
         _ensure_fastokens_patched()
 

@@ -146,6 +146,9 @@ def get_processor(
     model_name: Optional[str] = None,
     **kwargs,
 ):
+    # print(f"[tmp log] get_processor {tokenizer_backend=}")
+    # import traceback
+    # traceback.print_stack()
     if tokenizer_backend == "fastokens":
         from .tokenizer import _ensure_fastokens_patched
 

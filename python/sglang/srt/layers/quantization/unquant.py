@@ -410,7 +410,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
-        if _is_npu:
+        if _is_npu and get_moe_a2a_backend().is_ascend_fuseep():
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
             if hasattr(layer, "dispatcher"):

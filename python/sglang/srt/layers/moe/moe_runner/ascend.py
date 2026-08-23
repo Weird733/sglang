@@ -59,6 +59,8 @@ class AscendRunnerInput(RunnerInput):
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
     group_list_type: int  # 0 or 1 (passed to NPU ops)
+    # v2.2 自写 init 原生 exclusive offsets（int32 [E]）；stock init 为 None
+    expert_offsets: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -159,6 +161,12 @@ class AscendRunnerCore(MoeRunnerCore):
             )
 
         # --- w2 (down) projection ---
+        # v2.2 自写 init 产出的 exclusive offsets 直喂 persistent GMM2
+        # （offsets= 省 _gmm2_offsets_kernel ~4.4µs/层）；stock init 为 None，
+        # 不加该 kwarg，走 kernel 内置 offsets 前置 kernel（行为不变）。
+        w2_kwargs: dict = {}
+        if runner_input.expert_offsets is not None:
+            w2_kwargs["expert_offsets"] = runner_input.expert_offsets
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
             hidden_states,
@@ -167,6 +175,7 @@ class AscendRunnerCore(MoeRunnerCore):
             output_dtype=original_dtype,
             weight_prefix="w2",
             group_list_type=group_list_type,
+            **w2_kwargs,
         )
         return AscendRunnerOutput(hidden_states=hidden_states)
 
@@ -207,6 +216,7 @@ def pre_permute_ascend_tp_to_ascend(
         hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=dispatch_output.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
+        expert_offsets=getattr(dispatch_output, "expert_offsets", None),
     )
 
 
