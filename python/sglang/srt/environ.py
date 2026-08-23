@@ -527,6 +527,14 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
+    # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias
+    # 的 BF16 路径。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
+    SGLANG_MOE_FRONT_FUSION = EnvBool(False)
+    # GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton
+    # persistent kernel（默认 stock npu_grouped_matmul）。仅作用于 BF16 无量化
+    # 无 bias 路径，开启：SGLANG_GMM2_TRITON=1。
+    SGLANG_GMM2_TRITON = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2

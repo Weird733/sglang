@@ -5,6 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     capture_routed_experts_if_allowed,
@@ -14,6 +15,11 @@ from sglang.srt.layers.moe.topk import (
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+
+# MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
+# renorm=1 单算子路由 + v2.2 自写 init_routing。默认关，开启：
+# SGLANG_MOE_FRONT_FUSION=1。仅作用于下方 fast path（无 group/无 bias）。
+_moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
 
 
 def fused_topk_npu(
@@ -31,18 +37,40 @@ def fused_topk_npu(
 
     # Fast path: simple top-k without grouped routing and bias
     if not use_grouped_topk and correction_bias is None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
-            router_logits,
-            k=topk_config.top_k,
-        )
-
-        if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
+        if (
+            _moe_front_fusion
+            and renormalize
+            and topk_config.num_fused_shared_experts == 0
+        ):
+            # renorm=1 单算子 = gating_top_k_softmax + l1_norm（daikang 六轮单测：
+            # ids 与 stock 链逐位一致含构造并列对抗、weights 差 ≤3e-8，
+            # 链路口径 -10.2µs/层；输入 fp32 化与对拍链口径一致）。
+            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+                router_logits.to(torch.float32),
+                k=topk_config.top_k,
+                bias=None,
+                k_group=1,
+                group_count=1,
+                group_select_mode=0,
+                renorm=1,
+                norm_type=0,
+                routed_scaling_factor=1.0,
+                eps=float(1e-20),
             )
-        topk_weights = topk_weights.to(torch.float32)
+            topk_weights = topk_weights.to(torch.float32)
+        else:
+            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+                router_logits,
+                k=topk_config.top_k,
+            )
+
+            if renormalize:
+                topk_weights = l1_norm(
+                    topk_weights
+                    if topk_config.num_fused_shared_experts == 0
+                    else topk_weights[:, :-1]
+                )
+            topk_weights = topk_weights.to(torch.float32)
 
     # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
     # a torch path. top-k over (scores + bias); weights from un-biased scores.
