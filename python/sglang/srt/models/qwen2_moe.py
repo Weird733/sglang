@@ -493,6 +493,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        # [moe_whole_process/v1] enqueue 换序：先 alt 流长链（router+routed
+        # experts），再主流 shared expert。L0 profiling 证实原顺序下 shared 段
+        # （区域靠前部分）在 replay 时独占设备先跑、未被 routed 链掩盖；换序后
+        # 长链先起步，shared 的小 GEMM 可填 routed 前段小 kernel 的空窗。
+        # 依赖边不变（alt 仍只等 pre-MoE 主流点，汇合仍 main 等 alt），
+        # 两支对 hidden_states 均只读、clone 仍在主流——数值逐位等价。
+        with torch.cuda.stream(self.alt_stream):
+            router_output = self._forward_router_experts(hidden_states)
+
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate
@@ -516,9 +525,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 stage_shared_expert_add(shared_output, current_stream)
                 staged = True
         # ===== END TO BE REFACTORED ====
-
-        with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
 

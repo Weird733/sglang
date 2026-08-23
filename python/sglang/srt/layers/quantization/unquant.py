@@ -55,6 +55,13 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
+# v2.2 自写 init_routing（0 容差逐位验收），仅作用于 BF16 无量化路径。
+_moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
+# GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton
+# persistent kernel（默认 stock，开启：SGLANG_GMM2_TRITON=1）。仅作用于
+# BF16 无量化无 bias 路径。
+_gmm2_triton = envs.SGLANG_GMM2_TRITON.get()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -402,6 +409,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+        if _is_npu and _gmm2_triton:
+            # Triton GMM2 kernel 以裸指针按 [E, N, K] ND 连续存储读取 w2，
+            # 必须保证 ND 连续：FRACTAL_NZ 分形重排会让裸指针读取出错
+            # （本分支 unquant NPU 路径本身不做 format cast，此处仅兜底）。
+            layer.w2_weight.data = layer.w2_weight.data.contiguous()
         # if _is_npu:
         #     for weight_name in ["w13_weight", "w2_weight"]:
         #         weight = getattr(layer, weight_name)
@@ -739,19 +751,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         num_experts = layer.num_experts
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
-        hidden_states, expanded_row_idx, expert_tokens, _ = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                x,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=num_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
-                quant_mode=-1,
+        m = num_tokens * top_k
+        h = x.shape[1]
+        expert_offsets = None
+        if (
+            _moe_front_fusion
+            and m <= 512
+            and m % 8 == 0
+            and (h & (h - 1)) == 0
+            and x.dtype == torch.bfloat16
+        ):
+            # v2.2 自写 init routing（moe_front_fusion/v1，合入自 daikang 分支，
+            # 六轮单测 0 容差逐位验收）：语义与 npu_moe_init_routing_v2(type=1)
+            # 逐位一致，并原生输出 exclusive offsets（int32 [E]）供 persistent
+            # GMM2 offsets= 直用。形态门外回退 stock v2。
+            from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
+
+            hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
+                moe_init_routing_v22(x, topk_ids, num_experts, top_k)
             )
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
+            expert_offsets = excl
+        else:
+            hidden_states, expanded_row_idx, expert_tokens, _ = (
+                torch.ops.npu.npu_moe_init_routing_v2(
+                    x,
+                    topk_ids,
+                    active_num=m,
+                    expert_num=num_experts,
+                    expert_tokens_num_type=1,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[0, num_experts],
+                    quant_mode=-1,
+                )
+            )
+            expert_tokens = expert_tokens.to(torch.int64)
         w13_bias = [layer.w13_weight_bias] if self.with_bias else None
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
@@ -792,16 +825,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             hidden_states = GeluAndMul()(hidden_states)
 
         # gmm2: down_proj
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[layer.w2_weight.transpose(1, 2)],
-            bias=w2_bias,
-            split_item=2,
-            group_list_type=1,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
+        if _gmm2_triton and w2_bias is None:
+            # Triton persistent GMM2（gmm/v1，合入自 daikang 分支）：w2 为
+            # [E, N, K] ND 连续存储（跳过 FRACTAL_NZ cast），expert_tokens 为
+            # per-expert counts（group_list_type=1，int64）。offsets 缺省时由
+            # 内置前置 kernel 推导；SGLANG_MOE_FRONT_FUSION=1 时 v2.2 init
+            # 原生 excl 直喂，省 _gmm2_offsets_kernel ~4.4µs/层。
+            from sgl_kernel_npu.moe.persistent_gmm import persistent_grouped_matmul
+
+            hidden_states = persistent_grouped_matmul(
+                hidden_states,
+                layer.w2_weight,
+                expert_tokens,
+                offsets=expert_offsets,
+            )
+        else:
+            hidden_states = torch.ops.npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[layer.w2_weight.transpose(1, 2)],
+                bias=w2_bias,
+                split_item=2,
+                group_list_type=1,
+                group_type=0,
+                group_list=expert_tokens,
+                output_dtype=original_dtype,
+            )[0]
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
