@@ -154,6 +154,12 @@ if _is_npu:
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
+    # NPU 启用融合 qkvzba split kernel：改用 sgl_kernel_npu 版
+    # （graph 口径比 sglang 侧 triton_gdn_fused_proj 版快，且逐 bit 等价）
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
+
     # 全注意力段 decode 融合 kernel（full_attention A1b/A2）——
     # A1b split+norm+rope+KV scatter 合一、A2 sigmoid_mul 融合；调用点带形状
     # 守卫，未命中已验证形状自动回退 stock。
@@ -524,10 +530,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
+        # NPU 也走融合 split kernel（上方 import 已按平台重绑定为 sgl_kernel_npu 版）
         if (
             self.num_v_heads // self.num_k_heads in [1, 2, 4]
             and not _is_cpu
-            and not _is_npu
         ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
