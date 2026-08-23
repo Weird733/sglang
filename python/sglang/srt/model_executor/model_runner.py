@@ -610,6 +610,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
+                   # profile采集
+        import os
+        import torch_npu
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            # Initialize profiler
+            import torch_npu
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            )
+            self.profiler_npu = torch_npu.profiler.profile(
+                   activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                   with_modules=os.environ.get('WITH_MODULES', "false") == "true",
+                   profile_memory=os.environ.get('WITH_MEMORY', "false") == "true",
+                   record_shapes=os.environ.get('WITH_SHAPE', "false") == "true",
+                   with_stack=os.environ.get('WITH_STACK', "false") == "true",
+                   experimental_config=experimental_config,
+                   # 跳过前29步，warmup一步，采集30步，重复1次。
+                   schedule=torch_npu.profiler.schedule(wait=29, warmup=0, active=10, repeat=1),
+                   on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.environ.get('ROLLOUT_PROFILE_PATH'), analyse_flag=False)  # 采集数据保存路径，是否在线解析
+            )
+            self.profiler_npu.start()
+
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
     ):
@@ -3089,6 +3111,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_recover_ep_ranks()
+
+        import os
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            self.profiler_npu.step()  # 驱动 schedule，对部分decode step进行采集
 
         return output
 

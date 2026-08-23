@@ -154,6 +154,17 @@ if _is_npu:
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
+    # 全注意力段 decode 融合 kernel（full_attention A1b/A2）——
+    # A1b split+norm+rope+KV scatter 合一、A2 sigmoid_mul 融合；调用点带形状
+    # 守卫，未命中已验证形状自动回退 stock。
+    from sglang.srt.hardware_backend.npu.attention.full_attention_fusion_npu import (
+        fa_sigmoid_mul,
+        fa_sigmoid_mul_supported,
+        fa_split_qkvgate_scatter,
+        fa_split_qkvgate_scatter_supported,
+        fa_v4_scatter_context,
+    )
+
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -872,6 +883,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # full_attention A1b：TP 布局形状守卫在 init 时一次算定
+        # （q=2 头 / kv=1 头 / head_dim=256 / rope=64 / 带 gate 才走自研融合 kernel）
+        self._fa_v4_shape_ok = _is_npu and fa_split_qkvgate_scatter_supported(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            self.attn_output_gate,
+        )
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -988,6 +1009,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn.layer_id == (self.config.full_attention_interval - 1):
             self.rotary_emb.get_cos_sin_with_position(positions)
 
+        # full_attention A1b：decode 且命中已验证形状时，split+norm+rope 与 KV
+        # scatter 合一——k/v 由 kernel 按 out_cache_loc 直接写入 KV cache，返回
+        # k/v=None，self_attention 据此以 save_kv_cache=False 走 backend（跳过
+        # stock 的两次 npu_scatter_nd_update_）。守卫任一环节未命中则回退 stock
+        # split；SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 可按层打印未命中原因。
+        fa_ctx = fa_v4_scatter_context(self, forward_batch, qkv)
+        if fa_ctx is not None:
+            q, _, _, gate = fa_split_qkvgate_scatter(
+                qkv,
+                self.rotary_emb.position_sin,
+                self.rotary_emb.position_cos,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                int(self.head_dim * self.partial_rotary_factor),
+                eps=self.q_norm.variance_epsilon,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                kbuf=fa_ctx[0],
+                vbuf=fa_ctx[1],
+                loc=fa_ctx[2],
+            )
+            return q, None, None, gate
+
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
@@ -1035,14 +1080,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        # full_attention A1b：k is None ⟺ KV 已在融合 kernel 内 scatter 进 cache，
+        # backend 侧跳过 set_kv_buffer；其余路径 k 恒非 None，save_kv_cache=True
+        # 与 stock 默认值一致
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
 
         if self.attn_output_gate:
             if not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                attn_output.mul_(torch.sigmoid(gate_val))
+                # full_attention A2：sigmoid+mul 融合单 kernel，与 stock 双 op
+                # 舍入路径逐位一致；不满足守卫（非 bf16/非连续）回退 stock
+                if fa_sigmoid_mul_supported(attn_output, gate_val):
+                    attn_output = fa_sigmoid_mul(attn_output, gate_val)
+                else:
+                    attn_output.mul_(torch.sigmoid(gate_val))
 
         output, _ = self.o_proj(attn_output)
         return output
