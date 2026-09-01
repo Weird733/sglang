@@ -3740,7 +3740,12 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                current_platform.empty_cache()
+                # current_platform.empty_cache() is [Planned] — a no-op unless the
+                # platform plugin overrides it, and no NPU plugin is registered
+                # here. Use the device module so NPU engines actually release
+                # cached blocks to the driver (critical for colocate RL, where
+                # the trainer needs the engine's pool back between rollouts).
+                torch.get_device_module().empty_cache()
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
