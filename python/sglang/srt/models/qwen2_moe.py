@@ -996,7 +996,14 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        # Mirror qwen3_5.py: on NPU, SGLANG_NPU_USE_MULTI_STREAM also needs a
+        # real stream — _forward_deepep's dual-stream branch dereferences
+        # self.alt_stream unconditionally once enabled.
+        alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or (is_npu() and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            else None
+        )
         self.model = Qwen2MoeModel(
             config,
             quant_config,

@@ -1494,7 +1494,7 @@ class ModelConfig:
         default_sampling_params = {
             p: config.get(p) for p in available_params if config.get(p) is not None
         }
-
+        default_sampling_params = {'temperature': 1.0}
         return default_sampling_params
 
     def _maybe_pull_model_for_runai(self, model: str) -> None:

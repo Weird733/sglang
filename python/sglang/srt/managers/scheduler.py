@@ -3740,7 +3740,11 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                current_platform.empty_cache()
+                torch.npu.empty_cache()
+                # logger.info(f"empty_cache impl: {current_platform.empty_cache}")
+                # current_platform.empty_cache()
+                # logger.info(f"platform: {type(current_platform)}")          # <class 'sglang.srt.platforms.npu.NpuPlatform'>
+                # logger.info(f"mro: {type(current_platform).__mro__}")       # 继承链，能看出是否走到了基类的 no-op
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:

@@ -104,9 +104,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
     def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
         w = getattr(layer, "_conv_weights_t", None)
-        if w is None:
+        version = layer.conv_weights._version
+        if w is None or version != getattr(layer, "_conv_weights_t_version", None):
             w = layer.conv_weights.transpose(0, 1).contiguous()
             layer._conv_weights_t = w
+            layer._conv_weights_t_version = version
         return w
 
     def forward_decode(

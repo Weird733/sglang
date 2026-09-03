@@ -543,13 +543,10 @@ class Sampler(nn.Module):
 
         # Attach logprobs to logits_output (in-place modification)
         if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+
             # Same extraction as get_top_logprobs, but clamp the
             # [batch, max_k] topk result in a single kernel before
-            # slicing per request.
+            # slicing per request. Runs topk exactly once.
             max_k = max(top_logprobs_nums)
             top_vals, top_idx = logprobs.topk(max_k, dim=-1)
             if logprobs_are_probs:
@@ -570,7 +567,7 @@ class Sampler(nn.Module):
                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
             )
 
-            for row in logits_output.token_ids_logprobs_val:
+            for row in logits_output.next_token_token_ids_logprobs_val:
                 if torch.is_tensor(row):
                     if logprobs_are_probs:
                         row.log_()

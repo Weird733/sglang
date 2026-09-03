@@ -42,6 +42,118 @@ from sglang.srt.managers.io_struct import (
 
 logger = logging.getLogger(__name__)
 
+def _log_memory_snapshot(stage: str) -> None:
+    """One-shot colocate memory diagnostic: device-level vs torch-allocator view.
+
+    Logged from every TP scheduler around release_memory_occupation. A mismatch
+    (device used >> torch reserved after empty_cache) pinpoints memory held
+    outside the caching allocator — HCCL buffers, graph pools, driver — which
+    neither a TMS pause nor empty_cache can reclaim.
+    """
+    try:
+        device_module = torch.get_device_module()
+        free_bytes, total_bytes = device_module.mem_get_info()
+        used=total_bytes - free_bytes
+        logger.info(
+            f"[mem-snapshot:{stage}] device free={free_bytes / 2**30:.2f}GiB"
+            f" total={total_bytes / 2**30:.2f}GiB"
+            f" used={used / 2**30:.2f}GiB"
+            f" torch allocated={device_module.memory_allocated() / 2**30:.2f}GiB"
+            f" reserved={device_module.memory_reserved() / 2**30:.2f}GiB"
+        )
+    except Exception as e:
+        logger.warning(f"[mem-snapshot:{stage}] unavailable: {e}")
+
+
+def _log_segment_breakdown(stage: str) -> None:
+    """Aggregate memory_snapshot() segments to classify unreleased cache.
+
+    Splits reserved memory into: fully-free segments (releasable by empty_cache
+    — a large value after empty_cache means release itself is failing), free
+    space inside partially-active segments (fragmentation pinned by live
+    tensors), and a per-pool breakdown (segment_pool_id != 0 marks private /
+    graph pools that plain empty_cache never releases).
+    """
+    try:
+        snapshot = torch.get_device_module().memory_snapshot()
+        segments = snapshot if isinstance(snapshot, list) else snapshot.get("segments", [])
+        reserved = fully_free = frag_free = live = 0
+        n_free_segs = 0
+        pools: dict[str, list[int]] = {}
+        for seg in segments:
+            seg_total = seg.get("total_size", 0)
+            seg_live = sum(
+                b.get("size", 0) for b in seg.get("blocks", []) if str(b.get("state", "")).startswith("active")
+            )
+            reserved += seg_total
+            live += seg_live
+            if seg_live == 0:
+                fully_free += seg_total
+                n_free_segs += 1
+            else:
+                frag_free += seg_total - seg_live
+            pool = str(seg.get("segment_pool_id", "default"))
+            stats = pools.setdefault(pool, [0, 0])
+            stats[0] += 1
+            stats[1] += seg_total
+        pool_str = " ".join(f"pool[{p}]={v[0]}segs/{v[1] / 2**30:.2f}G" for p, v in sorted(pools.items()))
+        logger.info(
+            f"[mem-segments:{stage}] segs={len(segments)} reserved={reserved / 2**30:.2f}G"
+            f" live={live / 2**30:.2f}G"
+            f" releasable={n_free_segs}segs/{fully_free / 2**30:.2f}G"
+            f" frag_free={frag_free / 2**30:.2f}G {pool_str}"
+        )
+    except Exception as e:
+        logger.warning(f"[mem-segments:{stage}] unavailable: {e}")
+
+
+_census_prev: dict[tuple, int] = {}
+
+
+def _log_tensor_census(stage: str) -> None:
+    """Name the tensor shapes behind live-memory growth between releases.
+
+    _log_segment_breakdown shows where the allocator pool stands; this walks
+    gc for device tensors (unique storages, grouped by shape+dtype) and logs
+    the delta vs the previous call — a slow leak shows up as a consistently
+    growing shape.
+    """
+    try:
+        import gc
+
+        # torch_npu.npu -> "npu", torch.cuda -> "cuda": match storage.device.type
+        device_type = torch.get_device_module().__name__.rsplit(".", 1)[-1]
+        census: dict[tuple, int] = {}
+        seen_storage_ids: set[int] = set()
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                storage = obj.untyped_storage()
+                if id(storage) in seen_storage_ids or storage.device.type != device_type:
+                    continue
+                seen_storage_ids.add(id(storage))
+                key = (tuple(obj.shape), str(obj.dtype))
+                census[key] = census.get(key, 0) + storage.nbytes()
+            except Exception:
+                continue
+        total = sum(census.values())
+        growth = {k: v - _census_prev.get(k, 0) for k, v in census.items() if v > _census_prev.get(k, 0)}
+        _census_prev.clear()
+        _census_prev.update(census)
+        top_size = sorted(census.items(), key=lambda kv: -kv[1])[:6]
+        top_growth = sorted(growth.items(), key=lambda kv: -kv[1])[:6]
+
+        def fmt(items):
+            return "; ".join(f"{list(k[0])}x{k[1].replace('torch.', '')}={v / 2**20:.0f}M" for k, v in items)
+
+        logger.info(
+            f"[tensor-census:{stage}] total={total / 2**30:.2f}G"
+            f" top_by_size[{fmt(top_size)}]"
+            f" growth_vs_prev[{fmt(top_growth)}]"
+        )
+    except Exception as e:
+        logger.warning(f"[tensor-census:{stage}] unavailable: {e}")
 
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
@@ -186,6 +298,8 @@ class SchedulerWeightUpdaterManager:
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
 
+        _log_memory_snapshot("release-start")
+
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -223,6 +337,18 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
+
+        # The flush_cache above ran before the weights / cuda_graph pauses, so
+        # blocks freed by those pauses (and by _export_static_state temporaries)
+        # are still cached by the allocator. Empty once more after ALL pauses so
+        # the trainer starts its phase with the full headroom. Note
+        # current_platform.empty_cache() is a no-op here (no NPU platform
+        # plugin overrides it), hence the direct device-module call.
+
+        # torch.get_device_module().empty_cache()
+        _log_memory_snapshot("release-end")
+        # _log_segment_breakdown("release-end")
+        # _log_tensor_census("release-end")
 
         return ReleaseMemoryOccupationReqOutput()
 
