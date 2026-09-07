@@ -161,6 +161,14 @@ if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
+    # v1 变更（full_attention A3a）：行并行 add_gemma_rms_norm（grid=(batch,)），
+    # 与 stock 逐位一致；调用点带形状守卫，未命中自动回退 stock
+    # （见 resource/code/full_attention/）
+    from sglang.kernels.ops.attention.full_attention_fusion_npu import (
+        fa_add_gemma_rms_norm_v2,
+        fa_add_gemma_rms_norm_v2_supported,
+    )
+
 
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
@@ -995,9 +1003,17 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, residual = add_gemma_rms_norm(
-                x, self.weight, residual, self.variance_epsilon
-            )
+            # v1 变更（full_attention A3a）：行并行版（grid=(batch,)），数学与
+            # stock 完全一致（fp32 中间、gemma w+1）；hidden 非 2 的幂/非 bf16/
+            # 非连续时回退 stock
+            if fa_add_gemma_rms_norm_v2_supported(x, residual):
+                norm_out, residual = fa_add_gemma_rms_norm_v2(
+                    x, self.weight, residual, self.variance_epsilon
+                )
+            else:
+                norm_out, residual = add_gemma_rms_norm(
+                    x, self.weight, residual, self.variance_epsilon
+                )
             return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)

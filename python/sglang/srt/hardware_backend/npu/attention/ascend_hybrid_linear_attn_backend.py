@@ -27,16 +27,37 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
+        # cast_elimination_v2：AscendC recurrent（tp_ascendc_fusion_v2 op2，host GM 按
+        # int32_t* 读 cache_indices/cu_seqlens）的 int32 影子 buffer。v1 把
+        # state_indices/query_start_loc 上提 int64 喂 conv（host .to(kLong) no-op），
+        # 代价是 recurrent host 每层 .to(kInt) 真 cast ×2（图内）——同一组 buffer 喂两个
+        # dtype 契约不同的算子，总有一侧要 cast。解法=双 buffer：conv 用 int64 主 buffer，
+        # recurrent 用本组 int32 影子，图外 eager 每 step 同步一次（1~2 个小 copy），
+        # 图内零 cast。仅 decode/idle 图流程使用；eager 与 verify 路径恒 None
+        # （eager 元数据本就是基类现建 int32，无 cast 问题）。
+        self.decode_state_indices_i32_list = []
+        self.decode_query_start_loc_i32_list = []
+        self.cached_cuda_graph_decode_query_start_loc_i32 = None
+        self._decode_recurrent_shadow_i32 = None
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
+        # cast_elimination v1（= gdn_mamba v2 方案C 单摘）：state_indices_list /
+        # query_start_loc_list / cached_cuda_graph_decode/verify_query_start_loc
+        # 四个 buffer 改 int64，使 conv 类 AscendC 算子（torch.ops.npu.causal_conv1d
+        # 与 tp_fusion 的 fused_qkvzba_conv1d）host 侧的无条件 .to(kLong) 成为
+        # no-op（图内每层每 step 省 2 个 cast kernel）。kernel 本就按 int64_t* 读
+        # （causal_conv1d.h GlobalTensor<int64_t>），无契约变化。全树审计=
+        # 全链路无 int32 硬依赖（Triton kernel dtype 无差、copy_/fill_ 隐式 cast）。
+        # 例外：state_indices_list_gdn 硬依赖 int32（裸传 recurrent_gated_delta_rule
+        # 按 int32_t* 读且无校验，改了静默算错），保持不动。
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                    (i + 1,), self.pad_slot_id, dtype=torch.int64, device=self.device
                 )
             )
             self.state_indices_list_gdn.append(
@@ -48,7 +69,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 )
             )
             self.query_start_loc_list.append(
-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+                torch.zeros((i + 2,), dtype=torch.int64, device=self.device)
             )
             self.retrieve_next_token_list.append(
                 torch.zeros(
@@ -65,16 +86,53 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            # cast_elimination_v2：int32 影子（recurrent 侧），decode 时每 step 由
+            # _capture/_replay_metadata 从同内容源头同步（不在 verify 使用）。
+            self.decode_state_indices_i32_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.decode_query_start_loc_i32_list.append(
+                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+            0, max_bs + 1, dtype=torch.int64, device=self.device
+        )
+        # cast_elimination_v2：decode query_start_loc 内容是静态 arange——int32 版
+        # init 期预建，decode 影子同步只需一次同 dtype copy（无 cast kernel）。
+        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
             max_bs * draft_token_num + 1,
             step=draft_token_num,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
+
+    def _update_decode_recurrent_shadow_i32(
+        self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
+    ):
+        """cast_elimination_v2：同步 decode 的 int32 影子 buffer（图外 eager，每 step 一次）。
+
+        内容与 int64 主 buffer 完全一致（同一源头 copy_/fill_ 镜像维护），供
+        AscendC recurrent（host 按 int32_t* 读 cache_indices/cu_seqlens）直读，
+        把「每层 2 个图内 cast」换成「每 step 2 个图外小 copy」。仅 decode/idle
+        调用；verify/eager 路径由调用方把 _decode_recurrent_shadow_i32 置 None。
+        """
+        idx_i32 = self.decode_state_indices_i32_list[bs - 1]
+        qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]
+        idx_i32[: len(mamba_indices)].copy_(mamba_indices)
+        if num_padding == 0:
+            qsl_i32.copy_(self.cached_cuda_graph_decode_query_start_loc_i32[: bs + 1])
+        else:
+            qsl_i32[: bs - num_padding].copy_(
+                self.cached_cuda_graph_decode_query_start_loc_i32[: bs - num_padding]
+            )
+            qsl_i32[bs - num_padding :].fill_(bs - num_padding)
+        self._decode_recurrent_shadow_i32 = (qsl_i32, idx_i32)
 
     def _capture_metadata(
         self,
@@ -89,7 +147,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
+            self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
         elif forward_mode.is_target_verify():
+            self._decode_recurrent_shadow_i32 = None
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
@@ -163,7 +223,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     bs - num_padding
                 )
+            self._update_decode_recurrent_shadow_i32(bs, mamba_indices, num_padding)
         elif forward_mode.is_target_verify():
+            self._decode_recurrent_shadow_i32 = None
             ssm_state_indices = torch.arange(
                 bs * spec_info.draft_token_num,
                 dtype=torch.int32,

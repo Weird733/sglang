@@ -44,6 +44,13 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
+    # post_sample v3.2：全 batch temperature == 1.0 标记（host 侧，from_schedule_batch
+    # 由请求 host list 算出；merge 取与、filter 取子集天然保持）。True 时
+    # logits.div_(temperatures) 是 IEEE 逐位恒等（x/1.0 == x），sampler 跳过该
+    # RealDiv（decode 每 step 省一次 [B,V] 全 vocab 除法，实测 ~27µs@生产形态）。
+    # 默认 False（保守：不跳过），与旧版行为逐字一致。注意必须放在无默认字段
+    # （vocab_size）之后，否则 dataclass 报 non-default follows default。
+    temperatures_all_one: bool = False
     grammars: Optional[List] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -203,6 +210,11 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            # post_sample v3.2：host list 直算（float == 1.0 精确比较，
+            # 生产 --rollout-temperature 1 全 batch 命中）
+            temperatures_all_one=all(
+                r.sampling_params.temperature == 1.0 for r in reqs
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -444,6 +456,9 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        # post_sample v3.2：merge 取与（任一侧含非 1.0 温度即不跳过）；
+        # filter 取子集天然保持，无需维护。
+        self.temperatures_all_one &= other.temperatures_all_one
 
         self.adjusted_merge_batch(other)
 

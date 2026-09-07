@@ -21,6 +21,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
+import os
 
 import torch
 import torch.distributed as dist
@@ -215,6 +216,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
+    import torch_npu
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
@@ -393,6 +395,28 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+        import os
+        import torch_npu
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            # Initialize profiler
+            import torch_npu
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            )
+            self.profiler_npu = torch_npu.profiler.profile(
+                   activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                   with_modules=os.environ.get('WITH_MODULES', "false") == "true",
+                   profile_memory=os.environ.get('WITH_MEMORY', "false") == "true",
+                   record_shapes=os.environ.get('WITH_SHAPE', "false") == "true",
+                   with_stack=os.environ.get('WITH_STACK', "false") == "true",
+                   experimental_config=experimental_config,
+                   # 跳过前29步，warmup一步，采集30步，重复1次。
+                   schedule=torch_npu.profiler.schedule(wait=29, warmup=0, active=10, repeat=1),
+                   on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.environ.get('ROLLOUT_PROFILE_PATH'), analyse_flag=False)  # 采集数据保存路径，是否在线解析
+            )
+            self.profiler_npu.start()
+
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
@@ -1364,6 +1388,9 @@ class ModelRunner:
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
+        import os
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            self.profiler_npu.step()  # 驱动 schedule，对部分decode step进行采集
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(

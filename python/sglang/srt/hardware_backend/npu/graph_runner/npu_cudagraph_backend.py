@@ -37,6 +37,21 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
 
+@contextmanager
+def _disable_tms_during_graph_capture():
+    try:
+        from torch_memory_saver import torch_memory_saver
+        _impl = torch_memory_saver._impl
+    except Exception:
+        _impl = None
+
+    if _impl is not None:
+        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
+    try:
+        yield
+    finally:
+        if _impl is not None:
+            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
@@ -120,7 +135,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 auto_dispatch_capture=True,
             ),
         ):
-            out = forward_fn()
+            with _disable_tms_during_graph_capture():
+                out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

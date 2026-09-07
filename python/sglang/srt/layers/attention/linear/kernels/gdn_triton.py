@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -25,6 +27,26 @@ if is_npu():
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
+
+    # TP_FUSION v2 / gdn_recurrent_decode_opt：NPU decode 的 recurrent kernel 三选一
+    # （import 期判定，须在建图/服务启动前设置 env；图 capture 后改无效）：
+    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1  → AscendC 版（tp_ascendc_fusion_v2 包，
+    #       torch.ops.npu.fused_sigmoid_gating_recurrent 的 wrapper；守卫未命中时
+    #       wrapper 内部回退 stock Triton）
+    #   SGLANG_NPU_GDN_UPDATE_FUSED=1       → PR#740 decode 优化 Triton 版
+    #       （gdn_recurrent_decode_opt 包，须已部署 fla 侧文件）
+    #   均未设置                            → stock（生产现版，方案B strided）
+    # 两个 env 同开时 ASCENDC 优先。
+    if os.environ.get("SGLANG_NPU_GDN_RECURRENT_ASCENDC", "0") == "1":
+        from sglang.kernels.ops.tp_ascendc_fusion_npu import (
+            fused_sigmoid_gating_delta_rule_update_ascendc as _gdn_decode_update,
+        )
+    elif os.environ.get("SGLANG_NPU_GDN_UPDATE_FUSED", "0") == "1":
+        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
+            fused_sigmoid_gating_delta_rule_update_decode_npu as _gdn_decode_update,
+        )
+    else:
+        _gdn_decode_update = fused_sigmoid_gating_delta_rule_update
 elif is_cpu():
     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
 
@@ -150,7 +172,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_sigmoid_gating_delta_rule_update(
+        # TP_FUSION v2 / decode-opt：_gdn_decode_update 在 import 期按 env 绑定
+        # （ASCENDC / UPDATE_FUSED / stock 三选一）；kwargs 签名三方全对齐，无需改传参。
+        # target_verify 传扩展参数、不经过本方法，不受影响。
+        return _gdn_decode_update(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

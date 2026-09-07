@@ -127,3 +127,64 @@ class NPUMoEInitRouting_Quant(BaseInitRouting):
         )
         expert_tokens = expert_tokens.to(torch.int64)
         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale
+
+
+class NPUMoEInitRouting_v22(BaseInitRouting):
+    """
+    v2.2 自写 init routing（moe_front_fusion/v1，六轮单测 0 容差逐位验收）。
+
+    走 ``sgl_kernel_npu.moe.moe_front_routing.moe_init_routing_v22``（Triton
+    rank_hist + partials_cumsum + gather 三 launch），语义与
+    ``npu_moe_init_routing_v2(type=1)`` 逐位一致，并原生产出 exclusive
+    offsets（int32，``self.last_expert_offsets``）供 persistent GMM2
+    ``offsets=`` 直用（省 _gmm2_offsets_kernel ~4.4µs/层）。
+
+    仅支持 BF16 无量化路径（pertoken_scale=None）；形态门（decode 尺寸
+    M=T*top_k ≤512 且 M%8==0、H 为 2 的幂、bf16）之外回退 stock v2 实现。
+    """
+
+    def __init__(self):
+        self.last_expert_offsets: Optional[torch.Tensor] = None
+
+    def _init_routing(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        self.last_expert_offsets = None
+        num_tokens = hidden_states.shape[0]
+        m = num_tokens * top_k
+        h = hidden_states.shape[1]
+        if (
+            m <= 512
+            and m % 8 == 0
+            and (h & (h - 1)) == 0
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
+
+            hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
+                moe_init_routing_v22(
+                    hidden_states, topk_ids, num_experts, top_k
+                )
+            )
+            self.last_expert_offsets = excl
+            return hidden_states, expanded_row_idx, expert_tokens, None
+
+        # 形态门外（prefill 大尺寸 / 非验证 dtype）：回退 stock v2。
+        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+            torch.ops.npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids,
+                active_num=m,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, num_experts],
+                quant_mode=-1,
+            )
+        )
+        expert_tokens = expert_tokens.to(torch.int64)
+        return hidden_states, expanded_row_idx, expert_tokens, None

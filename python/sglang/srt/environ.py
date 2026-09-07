@@ -586,6 +586,16 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # MoE expert weight L2 prefetch (decode aclgraph; see
+    # hardware_backend/npu/moe_weight_prefetch.py)
+    SGLANG_NPU_MOE_PREFETCH = EnvBool(False)
+    # Comma-separated op list: gmm1 (w13, default) / gmm2 (w2, reserved for v1+)
+    SGLANG_NPU_MOE_PREFETCH_OPS = EnvStr("gmm1")
+    # auto / full / active; v1: auto == full, active falls back to full with warning
+    SGLANG_NPU_MOE_PREFETCH_MODE = EnvStr("auto")
+    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
+    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
+    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)

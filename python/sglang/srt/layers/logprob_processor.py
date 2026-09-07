@@ -673,16 +673,31 @@ class OutputLogprobProcessor:
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         batch_next_token_ids: torch.Tensor,
+        logprobs_are_probs: bool,
     ) -> LogprobResult:
-        # clamp to avoid -inf values
-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
+        # Clamp the extracted values instead of the full [batch, vocab]
+        # matrix. clamp(min=const) is elementwise and monotone
+        # non-decreasing, so it commutes with topk/gather: clamping the
+        # small outputs gives identical results (-inf -> finfo.min) while
+        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
+        clamp_min = torch.finfo(logprobs.dtype).min
 
         result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            # Same extraction as get_top_logprobs, but clamp the
+            # [batch, max_k] topk result in a single kernel before
+            # slicing per request.
+            max_k = max(top_logprobs_nums)
+            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
+            if logprobs_are_probs:
+                top_vals.log_()
+            top_vals.clamp_(min=clamp_min)
+            result.top_logprobs_val = [
+                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
+            result.top_logprobs_idx = [
+                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
+            ]
 
         if any(x is not None for x in token_ids_logprobs):
             (
@@ -691,11 +706,19 @@ class OutputLogprobProcessor:
             ) = get_token_ids_logprobs(
                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
             )
+            for row in result.token_ids_logprobs_val:
+                if torch.is_tensor(row):
+                    if logprobs_are_probs:
+                        row.log_()
+                    row.clamp_(min=clamp_min)
 
-        result.token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
-            batch_next_token_ids,
-        ]
+        # Gather one value per row directly; this removes the temporary arange
+        # and the 2-D advanced-index operation from the hot path.
+        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
+        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
+        if logprobs_are_probs:
+            next_token_logprobs.log_()
+        result.token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
         return result
 
     def compute_logprobs_only(

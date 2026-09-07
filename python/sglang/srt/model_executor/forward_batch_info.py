@@ -1062,19 +1062,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            # Text-only fast path: every mrope delta is 0, so
+            # (seq_positions + 0).flatten() == seq_positions. Build the (3, N)
+            # mrope positions directly from the parsed seq_positions -- never
+            # batch.spec_info.positions, so the draft_extend_v2 override
+            # (seq_positions=ret.positions) hits this path too -- and skip the
+            # zeros tensor plus the broadcast add.
+            self.mrope_positions = (
+                seq_positions.reshape(-1)
+                .to(dtype=torch.int64)
+                .unsqueeze(0)
+                .repeat(3, 1)
             )
-        else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            return
+
+        mrope_deltas = [
+            (
+                torch.zeros(1, dtype=torch.int64)
+                if mm_inputs[i] is None
+                else mm_inputs[i].mrope_position_delta.squeeze(0)
+            )
+            for i in range(batch_size)
+        ]
+        mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1107,12 +1117,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+        mm_inputs = batch.multimodal_inputs
+        rl_on_policy_target = get_server_args().rl_on_policy_target
+
+        if (
+            self.spec_info is None
+            and batch.dllm_config is None
+            and (
+                rl_on_policy_target is not None
+                or all(mm_input is None for mm_input in mm_inputs)
+            )
+        ):
+            # Regular text generation does not need to rebuild mRoPE on the
+            # host. init_new has already produced the same flattened token
+            # positions on model_runner.device: clamp_position() for decode,
+            # or compute_position() for extend/mixed. Text mRoPE has identical
+            # temporal/height/width coordinates, so materialize the three rows
+            # directly and avoid the per-request host factories, cat, and H2D.
+            self.mrope_positions = (
+                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+            )
+            return
+
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_server_args().rl_on_policy_target
         for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
+            mm_input = mm_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
                 if mm_input is None or rl_on_policy_target is not None:

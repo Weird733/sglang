@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
     NPUMoEInitRouting_v2,
+    NPUMoEInitRouting_v22,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -23,6 +24,12 @@ from sglang.srt.layers.moe.utils import (
     get_ascend_dispatcher_output_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import get_bool_env_var
+
+# MoE 前段融合包（moe_front_fusion/v1）总开关：BF16 路径用 v2.2 自写
+# init_routing（0 容差逐位验收），并向后传 exclusive offsets 供
+# persistent GMM2 直读。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
+_moe_front_fusion = get_bool_env_var("SGLANG_MOE_FRONT_FUSION")
 
 
 class AscendTPDispatchOutput(NamedTuple):
@@ -33,6 +40,8 @@ class AscendTPDispatchOutput(NamedTuple):
     expanded_row_idx: torch.Tensor
     expert_tokens: torch.Tensor
     group_list_type: int
+    # v2.2 自写 init 原生 exclusive offsets（int32 [E]）；stock init 为 None
+    expert_offsets: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -77,7 +86,10 @@ class AscendTPDispatcher(BaseDispatcher):
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
-            self.init = NPUMoEInitRouting_v2(quant_mode=-1)
+            if _moe_front_fusion:
+                self.init = NPUMoEInitRouting_v22()
+            else:
+                self.init = NPUMoEInitRouting_v2(quant_mode=-1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
@@ -117,6 +129,8 @@ class AscendTPDispatcher(BaseDispatcher):
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
+            # v22 init 产出 exclusive offsets；stock init 无此属性 → None
+            expert_offsets=getattr(self.init, "last_expert_offsets", None),
         )
         return self._dispatch_output
 

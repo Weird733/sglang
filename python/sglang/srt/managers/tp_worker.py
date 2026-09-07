@@ -526,6 +526,34 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _prepare_async_exponential(
+        self,
+        forward_batch: ForwardBatch,
+        is_verify: bool,
+    ) -> None:
+        """Start simple-sampling RNG before forward so it can overlap on NPU."""
+        if (
+            is_verify
+            or self.enable_spec
+            or forward_batch.is_prefill_only
+            or not forward_batch.forward_mode.is_decode()
+            or forward_batch.sampling_info is None
+            or forward_batch.sampling_info.grammars is not None
+        ):
+            return
+
+        sampler = self.model_runner.sampler
+        prepare = getattr(sampler, "prepare_async_exponential", None)
+        if prepare is None:
+            return
+
+        prepare(
+            batch_size=forward_batch.batch_size,
+            vocab_size=self.model_runner.model_config.vocab_size,
+            sampling_info=forward_batch.sampling_info,
+            device=forward_batch.input_ids.device,
+        )
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -561,6 +589,7 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
+            self._prepare_async_exponential(forward_batch, is_verify)
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,

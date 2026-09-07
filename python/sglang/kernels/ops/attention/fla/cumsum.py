@@ -75,7 +75,15 @@ def chunk_local_cumsum_scalar_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
+    # post_sample v3.1: key trimmed 7 -> 6 entries (dropped "HAS_SCALE").
+    # triton-ascend replaces triton.autotune with its AutoTilingTuner once the
+    # first Triton kernel is compiled in the process; AutoTilingTuner rejects
+    # key lists longer than its 6 axis names (x/y/z/w/v/t) at decoration time,
+    # so importing this module AFTER any Triton compile crashed engine boot
+    # with "Number of parameters exceeds the number of available axes".
+    # The key only controls autotune cache granularity; the tuned configs
+    # (BS/num_warps/num_stages) are unchanged.
+    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
